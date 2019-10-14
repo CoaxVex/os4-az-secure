@@ -1,0 +1,64 @@
+apiVersion: machine.openshift.io/v1beta1
+kind: MachineSet
+metadata:
+  labels:
+    machine.openshift.io/cluster-api-cluster: {{ os4_az_secure_cluster_name }}
+    machine.openshift.io/cluster-api-machine-role: {{ item.role }}
+    machine.openshift.io/cluster-api-machine-type: {{ item.role }}
+  name: {{ os4_az_secure_cluster_name }}-{{ item.role }}-{{ os4_az_secure_location }}{{ item.zone }}
+  namespace: openshift-machine-api
+spec:
+  replicas: {{ item.replicas }}
+  selector:
+    matchLabels:
+      machine.openshift.io/cluster-api-cluster: {{ os4_az_secure_cluster_name }}
+      machine.openshift.io/cluster-api-machineset: {{ os4_az_secure_cluster_name }}-{{ item.role }}-{{ os4_az_secure_location }}{{ item.zone }}
+  template:
+    metadata:
+      labels:
+        machine.openshift.io/cluster-api-cluster: {{ os4_az_secure_cluster_name }}
+        machine.openshift.io/cluster-api-machine-role: {{ item.role }}
+        machine.openshift.io/cluster-api-machine-type: {{ item.role }}
+        machine.openshift.io/cluster-api-machineset: {{ os4_az_secure_cluster_name }}-{{ item.role }}-{{ os4_az_secure_location }}{{ item.zone }}
+    spec:
+      metadata:
+        labels:
+          node-role.kubernetes.io/{{ item.role }}: ""
+      providerSpec:
+        value:
+          apiVersion: azureproviderconfig.openshift.io/v1beta1
+          credentialsSecret:
+            name: azure-cloud-credentials
+            namespace: openshift-machine-api
+          image:
+            offer: ""
+            publisher: ""
+            resourceID: /resourceGroups/{{ os4_az_secure_cluster_name }}-rg/providers/Microsoft.Compute/images/{{ os4_az_secure_cluster_name }}
+            sku: ""
+            version: ""
+          internalLoadBalancer: ""
+          kind: AzureMachineProviderSpec
+          location: {{ os4_az_secure_location }}
+          managedIdentity: {{ os4_az_secure_cluster_name }}-identity
+          osDisk:
+            diskSizeGB: {{ item.osDisk_diskSizeGB }}
+            managedDisk:
+              storageAccountType: Premium_LRS
+            osType: Linux
+          publicIP: {{ item.public_ip | default('false') }}
+          publicLoadBalancer: {{ os4_az_secure_cluster_name }}-{{ item.role }}-lb
+          resourceGroup: {{ os4_az_secure_cluster_name }}-rg
+          sshPrivateKey: ""
+          sshPublicKey: ""
+{% if item.subnet_name is defined %}
+          subnet: {{ os4_az_secure_cluster_name }}-{{ item.subnet_name }}-subnet
+{% else %}
+          subnet: {{ os4_az_secure_cluster_name }}-worker-subnet
+{% endif %}
+          userDataSecret:
+            name: worker-user-data
+          vmSize: {{ item.vmSize }}
+          vnet: {{ os4_az_secure_cluster_name }}-vnet
+          zone: "{{ item.zone }}"
+
+# vi: filetype=yaml

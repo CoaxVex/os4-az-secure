@@ -1,0 +1,255 @@
+- name: Purge controlplane security group rules to disable external access
+  # TODO: Selectively remove rules that allow access from any IP
+  azure_rm_securitygroup:
+    resource_group: "{{ os4_az_secure_cluster_name }}-rg"
+    name: "{{ os4_az_secure_cluster_name }}-controlplane-nsg"
+    purge_rules: yes
+    rules: []
+
+- name: Purge node security group rules to disable external access
+  # TODO: Selectively remove rules that allow access from any IP
+  azure_rm_securitygroup:
+    resource_group: "{{ os4_az_secure_cluster_name }}-rg"
+    name: "{{ os4_az_secure_cluster_name }}-node-nsg"
+    purge_rules: yes
+    rules: []
+
+- name: Retrieve the subnet id for infra nodes
+  azure_rm_virtualnetwork_facts:
+    resource_group: "{{ os4_az_secure_cluster_name }}-rg"
+    name: "{{ os4_az_secure_cluster_name }}-vnet"
+  register: os4_az_secure_vnet
+  check_mode: no
+
+- set_fact:
+    os4_az_secure_worker_subnet: "{{ os4_az_secure_vnet.virtualnetworks[0].subnets | selectattr('name', 'match', os4_az_secure_cluster_name + '-worker-subnet') | list | first }}"
+    check_mode: no
+
+- name: Create an internal load balancer for infra nodes
+  azure_rm_loadbalancer:
+    name: "{{ os4_az_secure_cluster_name }}-infra-lb"
+    resource_group: "{{ os4_az_secure_cluster_name }}-rg"
+    sku: Standard
+    frontend_ip_configurations:
+      - name: LoadBalancerFrontEnd
+        subnet: "{{ os4_az_secure_worker_subnet.id }}"
+    backend_address_pools:
+      - name: "{{ os4_az_secure_cluster_name }}-infra-lbbepool"
+    probes:
+      - name: TCP-80
+        protocol: Http
+        port: 1936
+        interval: 5
+        request_path: /healthz
+      - name: TCP-443
+        protocol: Http
+        port: 1936
+        interval: 5
+        request_path: /healthz
+    load_balancing_rules:
+      - name: TCP-80
+        frontend_ip_configuration: LoadBalancerFrontEnd
+        frontend_port: 80
+        backend_address_pool: "{{ os4_az_secure_cluster_name }}-infra-lbbepool"
+        backend_port: 80
+        protocol: Tcp
+        probe: TCP-80
+      - name: TCP-443
+        frontend_ip_configuration: LoadBalancerFrontEnd
+        frontend_port: 443
+        backend_address_pool: "{{ os4_az_secure_cluster_name }}-infra-lbbepool"
+        backend_port: 443
+        protocol: Tcp
+        probe: TCP-443
+
+- name: Create a network security group for router nodes
+  azure_rm_securitygroup:
+    resource_group: "{{ os4_az_secure_cluster_name }}-rg"
+    name: "{{ os4_az_secure_cluster_name }}-router-nsg"
+    rules:
+      - name: allow-TCP-80-Internet
+        protocol: Tcp
+        destination_port_range: 80
+        priority: 500
+      - name: allow-TCP-443-Internet
+        protocol: Tcp
+        destination_port_range: 443
+        priority: 501
+
+- name: Create a subnet for router nodes
+  azure_rm_subnet:
+    name: "{{ os4_az_secure_cluster_name }}-router-subnet"
+    resource_group: "{{ os4_az_secure_cluster_name }}-rg"
+    virtual_network_name: "{{ os4_az_secure_cluster_name }}-vnet"
+    address_prefix_cidr: "{{ os4_az_secure_router_subnet_cidr }}"
+    security_group: "{{ os4_az_secure_cluster_name }}-router-nsg"
+
+- name: Create a public ip for the router load balancer
+  azure_rm_publicipaddress:
+    name: "{{ os4_az_secure_cluster_name }}-router"
+    resource_group: "{{ os4_az_secure_cluster_name }}-rg"
+    sku: Standard
+    allocation_method: static
+
+- name: Create an external load balancer for router nodes
+  azure_rm_loadbalancer:
+    name: "{{ os4_az_secure_cluster_name }}-router-lb"
+    resource_group: "{{ os4_az_secure_cluster_name }}-rg"
+    sku: Standard
+    frontend_ip_configurations:
+      - name: LoadBalancerFrontEnd
+        public_ip_address: "{{ os4_az_secure_cluster_name }}-router"
+    backend_address_pools:
+      - name: "{{ os4_az_secure_cluster_name }}-router-lbbepool"
+    probes:
+      - name: TCP-80
+        protocol: Http
+        port: 1936
+        interval: 5
+        request_path: /healthz
+      - name: TCP-443
+        protocol: Http
+        port: 1936
+        interval: 5
+        request_path: /healthz
+    load_balancing_rules:
+      - name: TCP-80
+        frontend_ip_configuration: LoadBalancerFrontEnd
+        frontend_port: 80
+        backend_address_pool: "{{ os4_az_secure_cluster_name }}-router-lbbepool"
+        backend_port: 80
+        protocol: Tcp
+        probe: TCP-80
+      - name: TCP-443
+        frontend_ip_configuration: LoadBalancerFrontEnd
+        frontend_port: 443
+        backend_address_pool: "{{ os4_az_secure_cluster_name }}-router-lbbepool"
+        backend_port: 443
+        protocol: Tcp
+        probe: TCP-443
+
+# The endpointPublishingStrategy cannot be updated, so we need to detroy and recreate the ingresscontroller.
+# We run the risk that the operator notices that no default ingresscontroller is present, and rebuilds one with default settings, 
+# but it is not possible to scale it down first, as the finalizer on the existing object will block deletion.
+
+- name: Retrieve the default ingresscontroller
+  k8s_facts:
+    namespace: openshift-ingress-operator
+    kind: ingresscontroller
+    name: default
+  register: os4_az_secure_default_ingresscontroller
+  check_mode: no
+
+- set_fact:
+    os4_az_secure_replace_default_ingresscontroller: (os4_az_secure_default_ingresscontroller.resources[0].spec.endpointPublishingStrategy is not defined) or
+        (os4_az_secure_new_default_ingresscontroller.spec.endpointPublishingStrategy != os4_az_secure_default_ingresscontroller.resources[0].spec.endpointPublishingStrategy) or
+        (os4_az_secure_new_default_ingresscontroller.spec.nodePlacement != os4_az_secure_default_ingresscontroller.resources[0].spec.nodePlacement) 
+  check_mode: no
+
+- name: Delete existing default ingresscontroller
+  k8s:
+    name: default
+    kind: ingresscontroller
+    namespace: openshift-ingress-operator
+    force: yes
+    state: absent
+  when: os4_az_secure_replace_default_ingresscontroller | bool
+
+- name: Replace default ingresscontroller
+  k8s:
+    state: present
+    resource_definition:
+      apiVersion: operator.openshift.io/v1
+      kind: IngressController
+      metadata:
+        name: default
+        namespace: openshift-ingress-operator
+      spec:
+        replicas: 2
+        endpointPublishingStrategy:
+          type: HostNetwork
+        nodePlacement:
+          nodeSelector:
+            matchLabels:
+              node-role.kubernetes.io/infra: ""
+  when: os4_az_secure_replace_default_ingresscontroller | bool
+
+- name: Create public ingresscontroller
+  k8s:
+    state: present
+    resource_definition:
+      apiVersion: operator.openshift.io/v1
+      kind: IngressController
+      metadata:
+        name: public
+        namespace: openshift-ingress-operator
+      spec:
+        replicas: 2
+        domain: "{{ os4_az_secure_public_ingresscontroller_domain }}"
+        routeSelector:
+          matchLabels:
+            external: ""
+        endpointPublishingStrategy:
+          type: HostNetwork
+        nodePlacement:
+          nodeSelector:
+            matchLabels:
+              node-role.kubernetes.io/router: ""
+  when: os4_az_secure_deploy_public_ingresscontroller
+
+- name: Retrieve the Azure location
+  azure_rm_resourcegroup_facts:
+    name: "{{ os4_az_secure_cluster_name }}-rg"
+  register: os4_az_secure_resource_group
+  check_mode: no
+
+- set_fact:
+    os4_az_secure_location: "{{ os4_az_secure_resource_group.resourcegroups[0].location }}"
+
+- name: Create machinesets
+  k8s:
+    name: "{{ os4_az_secure_cluster_name }}-{{ item.role }}-{{ os4_az_secure_location }}{{ item.zone }}"
+    namespace: openshift-machine-api
+    resource_definition: "{{ lookup('template', 'machineset.yml.j2') }}"
+  loop: "{{ os4_az_secure_machinesets }}"
+
+- name: Retrieve the IP address of the internal infra load balancer
+  azure_rm_loadbalancer_facts:
+    name: "{{ os4_az_secure_cluster_name }}-infra-lb"
+    resource_group: "{{ os4_az_secure_cluster_name }}-rg"
+  register: os4_az_secure_infra_loadbalancer
+  check_mode: no
+
+- set_fact:
+    os4_az_secure_infra_loadbalancer_ip: "{{ os4_az_secure_infra_loadbalancer.ansible_facts.azure_loadbalancers[0].properties.frontendIPConfigurations[0].properties.privateIPAddress }}"
+    os4_az_secure_parent_domain: "{{ os4_az_secure_domain_name | regex_replace('^[^\\.]*\\.', '') }}"
+    os4_az_secure_subdomain: "{{ os4_az_secure_domain_name | regex_search('^[^\\.]*') }}"
+    check_mode: no
+
+- name: Create wildcard dns record
+  azure_rm_dnsrecordset:
+    zone_name: "{{ os4_az_secure_domain_name }}"
+    resource_group: "{{ os4_az_secure_cluster_name }}-rg"
+    record_type: A
+    relative_name: "*.apps"
+    time_to_live: 0
+    records:
+      - entry: "{{ os4_az_secure_infra_loadbalancer_ip }}"
+
+- name: Create wildcard dns record in parent domain
+  azure_rm_dnsrecordset:
+    zone_name: "{{ os4_az_secure_parent_domain }}"
+    resource_group: "{{ os4_az_secure_parent_domain_resource_group }}"
+    record_type: A
+    relative_name: "*.apps.{{ os4_az_secure_subdomain }}"
+    time_to_live: 0
+    records:
+      - entry: "{{ os4_az_secure_infra_loadbalancer_ip }}"
+
+- name: Remove api dns record in parent domain
+  azure_rm_dnsrecordset:
+    zone_name: "{{ os4_az_secure_parent_domain }}"
+    relative_name: "api.{{ os4_az_secure_subdomain }}"
+    state: absent
+    resource_group: "{{ os4_az_secure_parent_domain_resource_group }}"
+    record_type: CNAME

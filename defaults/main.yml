@@ -1,0 +1,32 @@
+os4_az_secure_debug: false
+os4_az_secure_cluster_name: ""
+os4_az_secure_domain_name: ""
+os4_az_secure_parent_domain_resource_group: ""
+os4_az_secure_router_subnet_cidr: "10.3.64.0/19"
+os4_az_secure_deploy_public_ingresscontroller: false
+os4_az_secure_public_ingresscontroller_domain: ""
+os4_az_secure_machinesets:
+  - role: router
+    replicas: 1
+    vmSize: Standard_DS2_v2
+    osDisk_diskSizeGB: 64
+    zone: 1
+    subnet_name: router
+  - role: router
+    replicas: 1
+    vmSize: Standard_DS2_v2
+    osDisk_diskSizeGB: 64
+    zone: 2
+    subnet_name: router
+  - role: infra
+    replicas: 1
+    vmSize: Standard_DS2_v2
+    osDisk_diskSizeGB: 64
+    zone: 1
+    public_ip: true
+  - role: infra
+    replicas: 1
+    vmSize: Standard_DS2_v2
+    osDisk_diskSizeGB: 64
+    zone: 2
+    public_ip: true
